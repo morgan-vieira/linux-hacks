@@ -1,0 +1,180 @@
+-- SPDX-License-Identifier: MIT
+--
+-- winaccel: Windows 11 "Enhance pointer precision" pointer ballistics for libinput.
+--
+-- GENERATED FILE - do not edit, re-run `winaccel apply` instead.
+--
+-- This plugin rewrites the REL_X/REL_Y counts of every evdev frame (one frame =
+-- one hardware packet, the same granularity Windows accelerates at) into the
+-- integer pixel deltas Windows 11 (win32kbase.sys, CDeviceAcceleration::Accelerate
+-- and CMouseProcessor::ApplyAccelerationToDelta) would produce. The device must
+-- use libinput's flat profile so libinput does not accelerate a second time;
+-- `winaccel apply` configures that in the compositor.
+--
+-- All arithmetic is 64-bit integer 16.16 fixed point, mirroring the machine code.
+
+libinput:register({1})
+
+local CFG = @CONFIG@
+
+local REL_X = evdev.REL_X
+local REL_Y = evdev.REL_Y
+
+-- C semantics on Lua integers: '/' truncates toward zero, '>> n' is arithmetic.
+local function idiv(a, b)
+    local q = a // b
+    if q < 0 and q * b ~= a then
+        q = q + 1
+    end
+    return q
+end
+
+local function sar16(v)
+    return v // 65536
+end
+
+-- Split a signed 16.16 value into (integer part toward zero, signed remainder).
+local function trunc16(v)
+    local ip
+    if v < 0 then
+        ip = -((-v) & ~0xFFFF)
+    else
+        ip = v & ~0xFFFF
+    end
+    return ip // 65536, v - ip
+end
+
+-- Windows keeps one set of remainders per session, shared by all mice.
+local rem_x, rem_y, prev_seg = 0, 0, 0
+local rem256_x, rem256_y = 0, 0
+
+local ballistics
+if CFG.epp then
+    local bx, slope, icpt = CFG.x, CFG.slope, CFG.intercept
+
+    -- CDeviceAcceleration::Accelerate (MouseSpeed != 0)
+    ballistics = function(dx, dy)
+        local X, Y = dx << 16, dy << 16
+        local ax, ay = math.abs(X), math.abs(Y)
+        local speed
+        if ay <= ax then
+            speed = ay // 2 + ax
+        else
+            speed = ax // 2 + ay
+        end
+        if speed == 0 then
+            return dx, dy
+        end
+
+        -- Segment search over x[0..3]; beyond x[3] segment 3 is extrapolated.
+        local i = 0
+        while i < 4 do
+            if speed <= bx[i + 1] then
+                break
+            end
+            i = i + 1
+        end
+        -- Windows reads out of bounds when speed <= x[0]; the generator
+        -- rejects such curves, clamp defensively anyway.
+        local seg = math.max(i - 1, 0)
+
+        local gain = idiv(icpt[seg + 1] << 16, speed) + slope[seg + 1]
+        if prev_seg < seg then
+            -- Entering a higher segment: average with the previous segment's gain.
+            gain = (gain + idiv(icpt[prev_seg + 1] << 16, speed) + slope[prev_seg + 1]) // 2
+        end
+        prev_seg = seg
+
+        local ox, oy
+        ox, rem_x = trunc16(sar16(X * gain) + rem_x)
+        oy, rem_y = trunc16(sar16(Y * gain) + rem_y)
+        return ox, oy
+    end
+else
+    local f = CFG.factor256
+
+    -- CMouseProcessor::ApplyAccelerationToDelta (MouseSpeed == 0)
+    ballistics = function(dx, dy)
+        if f == 256 then
+            return dx, dy
+        end
+        if dx ~= 0 then
+            local v = f * dx + rem256_x
+            dx = idiv(v, 256)
+            rem256_x = v - dx * 256
+        end
+        if dy ~= 0 then
+            local v = f * dy + rem256_y
+            dy = idiv(v, 256)
+            rem256_y = v - dy * 256
+        end
+        return dx, dy
+    end
+end
+
+local function frame_handler(device, frame, timestamp)
+    local ix, iy
+    local dx, dy = 0, 0
+    for i, e in ipairs(frame) do
+        if e.usage == REL_X then
+            if ix then frame[ix].value = 0 end
+            ix = i
+            dx = dx + e.value
+        elseif e.usage == REL_Y then
+            if iy then frame[iy].value = 0 end
+            iy = i
+            dy = dy + e.value
+        end
+    end
+    if not ix and not iy then
+        return nil
+    end
+
+    local ox, oy = ballistics(dx, dy)
+    if ox == dx and oy == dy then
+        return nil
+    end
+
+    if ix then
+        frame[ix].value = ox
+    elseif ox ~= 0 then
+        frame[#frame + 1] = { usage = REL_X, value = ox }
+    end
+    if iy then
+        frame[iy].value = oy
+    elseif oy ~= 0 then
+        frame[#frame + 1] = { usage = REL_Y, value = oy }
+    end
+    return frame
+end
+
+local function wanted(device)
+    local usages = device:usages()
+    if not usages[REL_X] or not usages[REL_Y] then
+        return false
+    end
+    local udev = device:udev_properties()
+    if udev.ID_INPUT_TOUCHPAD or udev.ID_INPUT_TABLET then
+        return false
+    end
+    if not (udev.ID_INPUT_MOUSE or udev.ID_INPUT_POINTINGSTICK) then
+        return false
+    end
+    if #CFG.devices == 0 then
+        return true
+    end
+    local info = device:info()
+    for _, d in ipairs(CFG.devices) do
+        if d.vid == info.vid and d.pid == info.pid then
+            return true
+        end
+    end
+    return false
+end
+
+libinput:connect("new-evdev-device", function(device)
+    if wanted(device) then
+        libinput:log_info("winaccel: Windows pointer ballistics enabled for " .. device:name())
+        device:connect("evdev-frame", frame_handler)
+    end
+end)
